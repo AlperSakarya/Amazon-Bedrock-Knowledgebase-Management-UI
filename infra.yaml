@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Deploys intake & approved S3 buckets, a DynamoDB table for the changelog, a version counter table, and two Lambdas."
+
+Resources:
+  
+  # ✅ S3 Bucket for Intake (Raw documents)
+  IntakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "kb-intake-${AWS::AccountId}"  
+
+  # ✅ S3 Bucket for Approved Documents (KB storage)
+  KBApprovedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "kb-approved-${AWS::AccountId}"  
+
+  # ✅ DynamoDB Table for Tracking File Status (Changelog)
+  ChangelogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: changelogDB
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: file_name
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: file_name
+          KeyType: HASH  # Partition Key
+        - AttributeName: timestamp
+          KeyType: RANGE # Sort Key
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # ✅ DynamoDB Table for Version Counter (global KB version)
+  VersionCounterTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: versionCounter
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: counter_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: counter_id
+          KeyType: HASH
+
+  # ✅ IAM Role for Lambda to Access S3 & DynamoDB
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: KBProcessingLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: KBProcessingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt IntakeBucket.Arn
+                  - !Sub "${IntakeBucket.Arn}/*"
+                  - !GetAtt KBApprovedBucket.Arn
+                  - !Sub "${KBApprovedBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ChangelogTable.Arn
+                  - !GetAtt VersionCounterTable.Arn
+                  - !Sub "${VersionCounterTable.Arn}/*"
+
+  # ✅ Lambda Function to Process Approvals (increments global version on approval)
+  ApproveFileLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: KBApproveFile
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3_client = boto3.client("s3")
+          dynamodb = boto3.client("dynamodb")
+
+          INTAKE_BUCKET = os.environ["INTAKE_BUCKET"]
+          APPROVED_BUCKET = os.environ["APPROVED_BUCKET"]
+          TABLE_NAME = os.environ["TABLE_NAME"]
+          VERSION_TABLE = os.environ["VERSION_TABLE"]
+
+          def lambda_handler(event, context):
+              file_name = event["file_name"]
+              timestamp = event["timestamp"]
+
+              try:
+                  # Increment version counter by 1 in VersionCounterTable
+                  response_counter = dynamodb.update_item(
+                      TableName=VERSION_TABLE,
+                      Key={"counter_id": {"S": "global"}},
+                      UpdateExpression="ADD #val :inc",
+                      ExpressionAttributeNames={"#val": "value"},
+                      ExpressionAttributeValues={":inc": {"N": "1"}},
+                      ReturnValues="UPDATED_NEW"
+                  )
+                  new_counter = int(response_counter["Attributes"]["value"]["N"])
+                  # The approved file gets version "v1.(new_counter-1)"
+                  kb_version = f"v1.{new_counter - 1}"
+
+                  # Copy file to KBApprovedBucket
+                  copy_source = {'Bucket': INTAKE_BUCKET, 'Key': file_name}
+                  s3_client.copy_object(CopySource=copy_source, Bucket=APPROVED_BUCKET, Key=file_name)
+
+                  # Update DynamoDB record to 'Approved' and set kb_version
+                  dynamodb.update_item(
+                      TableName=TABLE_NAME,
+                      Key={"file_name": {"S": file_name}, "timestamp": {"N": str(timestamp)}},
+                      UpdateExpression="SET #st = :new_status, kb_version = :new_version",
+                      ExpressionAttributeNames={"#st": "status"},
+                      ExpressionAttributeValues={
+                          ":new_status": {"S": "Approved"},
+                          ":new_version": {"S": kb_version}
+                      }
+                  )
+
+                  return {"statusCode": 200, "body": f"{file_name} approved with version {kb_version}."}
+
+              except Exception as e:
+                  return {"statusCode": 500, "body": str(e)}
+      Environment:
+        Variables:
+          INTAKE_BUCKET: !Ref IntakeBucket
+          APPROVED_BUCKET: !Ref KBApprovedBucket
+          TABLE_NAME: !Ref ChangelogTable
+          VERSION_TABLE: !Ref VersionCounterTable
+
+  # ✅ Lambda Function to Delete Files (only allows deletion of the latest approved file)
+  DeleteFileLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: KBDeleteFile
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3_client = boto3.client("s3")
+          dynamodb = boto3.client("dynamodb")
+
+          INTAKE_BUCKET = os.environ["INTAKE_BUCKET"]
+          APPROVED_BUCKET = os.environ["APPROVED_BUCKET"]
+          TABLE_NAME = os.environ["TABLE_NAME"]
+          VERSION_TABLE = os.environ["VERSION_TABLE"]
+
+          def lambda_handler(event, context):
+              file_name = event["file_name"]
+              timestamp = event["timestamp"]
+
+              try:
+                  # Retrieve the file record from the changelog table
+                  file_record = dynamodb.get_item(
+                      TableName=TABLE_NAME,
+                      Key={"file_name": {"S": file_name}, "timestamp": {"N": str(timestamp)}}
+                  ).get("Item")
+                  
+                  if not file_record:
+                      return {"statusCode": 404, "body": "File record not found."}
+                  
+                  status = file_record.get("status", {}).get("S", "")
+                  kb_version = file_record.get("kb_version", {}).get("S", "pending")
+                  
+                  # For approved files, only allow deletion if this is the latest version.
+                  if status == "Approved":
+                      # Get current global version counter
+                      global_record = dynamodb.get_item(
+                          TableName=VERSION_TABLE,
+                          Key={"counter_id": {"S": "global"}}
+                      ).get("Item")
+                      if not global_record:
+                          return {"statusCode": 500, "body": "Global version record not found."}
+                      global_counter = int(global_record.get("value", {}).get("N", "0"))
+                      latest_version = f"v1.{global_counter - 1}" if global_counter > 0 else "v1.0"
+                      if kb_version != latest_version:
+                          return {"statusCode": 400, "body": "Only the latest approved version can be deleted."}
+
+                  # Delete from S3 – attempt both buckets
+                  try:
+                      s3_client.delete_object(Bucket=APPROVED_BUCKET, Key=file_name)
+                  except Exception as e:
+                      print(f"Warning: Could not delete from Approved Bucket: {e}")
+                  try:
+                      s3_client.delete_object(Bucket=INTAKE_BUCKET, Key=file_name)
+                  except Exception as e:
+                      print(f"Warning: Could not delete from Intake Bucket: {e}")
+
+                  # Delete the record from the changelog table
+                  dynamodb.delete_item(
+                      TableName=TABLE_NAME,
+                      Key={"file_name": {"S": file_name}, "timestamp": {"N": str(timestamp)}}
+                  )
+
+                  # If the file was approved, decrement the global version counter
+                  if status == "Approved":
+                      # Ensure that the counter does not go below 0.
+                      # Using an update_item with a condition expression to prevent negative values.
+                      try:
+                          dynamodb.update_item(
+                              TableName=VERSION_TABLE,
+                              Key={"counter_id": {"S": "global"}},
+                              UpdateExpression="ADD #val :dec",
+                              ExpressionAttributeNames={"#val": "value"},
+                              ExpressionAttributeValues={
+                                  ":dec": {"N": "-1"},
+                                  ":zero": {"N": "0"}
+                              },
+                              ConditionExpression="attribute_exists(#val) AND #val > :zero"
+                          )
+                      except Exception as e:
+                          # If condition fails, force value to 0
+                          dynamodb.put_item(
+                              TableName=VERSION_TABLE,
+                              Item={"counter_id": {"S": "global"}, "value": {"N": "0"}}
+                          )
+
+                  return {"statusCode": 200, "body": f"{file_name} deleted successfully."}
+
+              except Exception as e:
+                  return {"statusCode": 500, "body": str(e)}
+      Environment:
+        Variables:
+          INTAKE_BUCKET: !Ref IntakeBucket
+          APPROVED_BUCKET: !Ref KBApprovedBucket
+          TABLE_NAME: !Ref ChangelogTable
+          VERSION_TABLE: !Ref VersionCounterTable
+
+Outputs:
+  IntakeBucket:
+    Value: !Ref IntakeBucket
+    Description: "S3 bucket for incoming documents."
+
+  KBApprovedBucket:
+    Value: !Ref KBApprovedBucket
+    Description: "S3 bucket for approved knowledge base files."
+
+  DynamoDBTable:
+    Value: !Ref ChangelogTable
+    Description: "The DynamoDB table for file tracking."
