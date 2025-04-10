@@ -18,7 +18,7 @@ lambda_client = boto3.client("lambda")
 bedrock_build_client = boto3.client("bedrock-agent")
 
 ##### YOU NEED TO UPDATE THIS VALUE WITH YOUR KB ID #####
-bedrock_kb_id = "TJI3QHJ4XF"  # Bedrock Knowledge Base ID
+bedrock_kb_id = ""  # Bedrock Knowledge Base ID E.g TJI3QHJ4BB
 bedrock_model_arn = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2"  # Bedrock Model ARN
 
 st.set_page_config(
@@ -36,7 +36,7 @@ load_local_css("custom.css")
 def get_s3_bucket_names():
     """Fetch both Intake and Approved S3 bucket names from CloudFormation stack outputs."""
     try:
-        response = cloudformation.describe_stacks(StackName="brkb2")
+        response = cloudformation.describe_stacks(StackName="MyKBUIStack")
         outputs = response["Stacks"][0]["Outputs"]
 
         intake_bucket = None
