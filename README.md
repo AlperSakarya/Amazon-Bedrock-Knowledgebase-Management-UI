@@ -1,11 +1,11 @@
-# Bedrock Knowledge Base Management System
+# Bedrock Knowledge Base Management System Demo
 
-This project implements a comprehensive Knowledge Base (KB) management system using AWS Bedrock, S3, DynamoDB, and Lambda. It provides a user-friendly interface for chatting with the KB, managing documents, and monitoring data sources.
+This project implements a simple Knowledge Base (KB) management system using AWS Bedrock, S3, DynamoDB, and Lambda. It provides a user-friendly interface for chatting with the KB, managing documents, and monitoring data sources.
 
 The system consists of a Streamlit web application for user interaction and an AWS infrastructure stack for backend operations. It allows users to chat with the KB, view and manage documents, track changes, and monitor data source statuses.
 
 ![Preview](architecture-diagram.png)
-
+![Preview](screenshot.png)
 ## Repository Structure
 
 ```
@@ -36,11 +36,19 @@ Prerequisites:
 
 To install the required Python packages:
 
-```pip install -r requirements.txt```
+```pip 
+install -r requirements.txt
+```
 or
 ```bash
 pip install streamlit boto3 pandas pytz
 ```
+
+Deploy the infra.yaml with CloudFormation
+```aws
+cloudformation deploy --template-file infra.yaml --stack-name MyKBUIStack --capabilities CAPABILITY_NAMED_IAM
+```
+You need to create the Bedrock KB manually and feed it in to the app.py to keep things simpler.
 
 ### Configuration
 
